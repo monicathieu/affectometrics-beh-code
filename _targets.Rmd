@@ -1,0 +1,172 @@
+---
+title: "Target Markdown"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+require(targets)
+require(tarchetypes)
+```
+
+Target Markdown is a powerful R Markdown interface for reproducible analysis pipelines, and the chapter at https://books.ropensci.org/targets/markdown.html walks through it in detail. This R Markdown report the example from the chapter. Try it out in both interactive and non-interactive modes, either by running the code chunks in different ways or setting the `tar_interactive` chunk option.
+
+```{r}
+tar_unscript() # delete temp files from previous run
+```
+
+
+# Globals
+
+We first define some global options/functions common to all targets. The function below plots a histogram of ozone concentrations, and our histogram target will need it.
+
+```{targets qs-globals, tar_globals = TRUE}
+tar_option_set(packages = c("dplyr", "readr", "tidyr", "purrr", "magrittr", "rlang", "qualtRics"))
+
+# replace this with sourcing functions script(s)
+source(here::here("R", "utils", "qualtrics_get.R"))
+source(here::here("R", "utils", "qualtrics_proc.R"))
+source(here::here("R", "utils", "emo_clean.R"))
+source(here::here("R", "utils", "emo_scrub.R"))
+source(here::here("R", "emo_pca.R"))
+source(here::here("R", "emo_model.R"))
+```
+
+# Targets
+
+## Questionnaire data
+
+```{targets qualtrics-get}
+list(
+  tar_target(qs_rd1_raw_numeric, here::here("ignore", "data", "qs_raw", "qs_rd1_raw_numeric.csv"), format = "file"),
+  tar_target(qs_rd1_raw_choicetext, here::here("ignore", "data", "qs_raw", "qs_rd1_raw_choicetext.csv"), format = "file"),
+  tar_target(qs_rd2_raw_numeric, here::here("ignore", "data", "qs_raw", "qs_rd2_raw_numeric.csv"), format = "file"),
+  tar_target(qs_rd2_raw_choicetext, here::here("ignore", "data", "qs_raw", "qs_rd2_raw_choicetext.csv"), format = "file"),
+  tar_target(qs_followup_raw_numeric, here::here("ignore", "data", "qs_raw", "qs_followup_raw_numeric.csv"), format = "file"),
+  tar_target(qs_rd1, get_senpai_qualtrics(qs_rd1_raw_numeric, qs_rd1_raw_choicetext)),
+  tar_target(qs_rd2, get_senpai_qualtrics(qs_rd2_raw_numeric, qs_rd2_raw_choicetext)),
+  tar_target(qs_followup, get_senpai_qualtrics_followup(qs_followup_raw_numeric))
+)
+```
+
+```{targets qs_allsubs, tar_simple = TRUE}
+qs_bind(qs_rd1, qs_rd2, qs_followup)
+```
+
+## Task data
+
+### Clean/preprocess data from Gorilla
+
+```{targets task-raw-filenames}
+require(tarchetypes)
+task_af_raw <- tar_map(values = tibble(filename = list.files(here::here("ignore", "data", "raw", "amuse_fear_032218"),
+                                              full.names = TRUE)) %>%
+          separate(filename, into = c(rep(NA, times = 9), "filename_short", NA), sep = "[/.]", remove = FALSE) %>% 
+          filter(endsWith(filename_short, "first")),
+        tar_target(task_raw, filename, format = "file"),
+        names = filename_short)
+
+task_pn_raw <- tar_map(values = tibble(filename = list.files(here::here("ignore", "data", "raw", "pos_neg_040518"),
+                                              full.names = TRUE)) %>%
+          separate(filename, into = c(rep(NA, times = 9), "filename_short", NA), sep = "[/.]", remove = FALSE) %>% 
+          filter(endsWith(filename_short, "first")),
+        tar_target(task_raw, filename, format = "file"),
+        names = filename_short)
+
+list(task_af_raw,
+     task_pn_raw)
+```
+
+```{targets task-get}
+list(
+  tar_target(task_af, clean_task_af(c(task_raw_amuse_cat_first,
+                                      task_raw_amuse_cont_first,
+                                      task_raw_fear_cat_first,
+                                      task_raw_fear_cont_first))),
+  tar_target(task_pn, clean_task_pn(c(task_raw_pos_cat_first,
+                                      task_raw_pos_cont_first,
+                                      task_raw_neg_cat_first,
+                                      task_raw_neg_cont_first)))
+)
+```
+
+```{targets task_allsubs, tar_simple = TRUE}
+clean_task_combine(task_af, task_pn)
+```
+
+### Scrub bad boys
+
+```{targets task-scrub}
+list(
+  tar_target(scrub_data, id_bad_subjs(task_allsubs, qs_allsubs)),
+  tar_target(task_goodsubs, scrub_task(task_allsubs, qs_allsubs, scrub_data)),
+  tar_target(badsubs, get_bad_subjs(scrub_data))
+)
+```
+
+## Statistiques
+
+### Transform questionnaire scores to PCA
+
+```{targets pca}
+list(
+  tar_target(qs_goodsubs, get_pca_qs(qs_allsubs, badsubs)),
+  tar_target(qs_pca, estimate_pca(qs_goodsubs)),
+  tar_target(pcs_goodsubs, get_pc_scores(qs_pca, qs_goodsubs))
+)
+```
+
+### Fit models? Horrifying
+
+ONLY! modeling the unipolar data
+
+```{targets models_prerun, tar_simple = TRUE}
+read_rds(here::here("ignore", "data", "models.rds"))
+```
+
+```{targets get_model_prerun, tar_globals = TRUE}
+get_model_prerun <- function (models, emo_block, resp_type) {
+  models %>% 
+    filter(emo_block == emo_block) %>% 
+    select(model = !!paste0("model_", resp_type)) %>% 
+    pull(model) %>% 
+    pluck(1)
+}
+```
+
+
+```{targets fit}
+require(tarchetypes) # does this need to be in every chunk calling tarchetypes functions?
+
+model <- tar_map(values = tibble(emo_block = c("0 to +", "0 to -"),
+                                 emo_block_short = c("pos", "neg"),
+                                 resp_type = c("cat", "cont")) %>% 
+                   expand(nesting(emo_block, emo_block_short), resp_type),
+                 #tar_toggle(get_model_prerun(models_prerun, emo_block, resp_type),
+                  #          fit_emo_model(task_goodsubs, pcs_goodsubs, emo_block, resp_type)),
+                 tar_target(model, get_model_prerun(models_prerun, emo_block, resp_type)),
+                 names = c(emo_block_short, resp_type))
+
+list(model)
+```
+
+
+# Pipeline
+
+If you ran all the `{targets}` chunks in non-interactive mode, then your R scripts are set up to run the pipeline.
+
+```{r}
+tar_make()
+```
+
+# Output
+
+You can retrieve results from the `_targets/` data store using `tar_read()` or `tar_load()`.
+
+The `targets` dependency graph helps your readers understand the steps of your pipeline at a high level.
+
+```{r}
+tar_visnetwork()
+```
+
+At this point, you can go back and run `{targets}` chunks in interactive mode without interfering with the code or data of the non-interactive pipeline.
